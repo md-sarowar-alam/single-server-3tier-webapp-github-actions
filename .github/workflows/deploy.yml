@@ -75,45 +75,23 @@ jobs:
           EOF
           
       - name: Pull latest code from GitHub
-        if: steps.check_deployment.outputs.FIRST_TIME == 'false'a NVM..."
-            if [ ! -d "$HOME/.nvm" ]; then
-              curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
-              export NVM_DIR="$HOME/.nvm"
-              [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-              nvm install --lts
-              nvm use --lts
-              nvm alias default node
+        run: |
+          ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+            set -e
+            
+            # Clone or pull repository
+            if [ ! -d "${{ env.DEPLOY_PATH }}" ]; then
+              echo "📥 Cloning repository..."
+              git clone https://github.com/${{ github.repository }} "${{ env.DEPLOY_PATH }}"
+            else
+              echo "🔄 Pulling latest changes..."
+              cd "${{ env.DEPLOY_PATH }}"
+              git fetch origin
+              git reset --hard origin/main
+              git pull origin main
             fi
             
-            # Install PostgreSQL
-            echo "📦 Installing PostgreSQL..."
-            if ! command -v psql &> /dev/null; then
-              sudo apt install -y postgresql postgresql-contrib
-              sudo systemctl enable postgresql
-              sudo systemctl start postgresql
-            fi
-            
-            # Install Nginx
-            echo "📦 Installing Nginx..."
-            if ! command -v nginx &> /dev/null; then
-              sudo apt install -y nginx
-              sudo systemctl enable nginx
-              sudo systemctl start nginx
-            fi
-            
-            # Install PM2 globally
-            echo "📦 Installing PM2..."
-            export NVM_DIR="$HOME/.nvm"
-            [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-            npm install -g pm2
-            pm2 startup | tail -n 1 | sudo bash || true
-            
-            # Install Git (if not already installed)
-            if ! command -v git &> /dev/null; then
-              sudo apt install -y git
-            fi
-            
-            echo "✅ Prerequisites installed successfully"
+            echo "✅ Code updated successfully"
           EOF
           
       - name: Setup PostgreSQL database (first-time only)
