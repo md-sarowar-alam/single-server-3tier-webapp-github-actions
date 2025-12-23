@@ -6,10 +6,11 @@ This guide explains how to configure GitHub Actions for automated deployment of 
 
 The GitHub Actions workflow automatically deploys your application whenever you push code to the `main` branch. The workflow intelligently handles:
 
-- ✅ **First-time deployment:** Installs all prerequisites (Node.js, PostgreSQL, Nginx, PM2), sets up database, deploys application
-- ✅ **Update deployments:** Creates backup, pulls latest code, runs new migrations, restarts services
-- ✅ **Health checks:** Verifies deployment success automatically
-- ✅ **Rollback support:** Quick recovery if something goes wrong
+- **First-time deployment:** Installs all prerequisites (NVM, Node.js, Nginx, PM2), deploys application
+- **Update deployments:** Creates backup, pulls latest code, restarts services
+- **Health checks:** Verifies deployment success automatically
+- **Rollback support:** Quick recovery if something goes wrong
+- **Automated configuration:** Creates Nginx config, sets up PM2, handles server.js location
 
 ---
 
@@ -29,24 +30,25 @@ The GitHub Actions workflow automatically deploys your application whenever you 
 
 ---
 
-### Scenario 2: Fresh EC2 Instance (Everything Automated) ⭐
+### Scenario 2: Fresh EC2 Instance (Everything Automated)
 
 **When to use:** Starting from a brand new EC2 instance
 
 **What you need:**
-1. ✅ Fresh EC2 instance launched (Ubuntu 22.04 LTS)
-2. ✅ Security group allows SSH (22), HTTP (80), HTTPS (443)
-3. ✅ SSH key pair to access EC2
-4. ✅ Repository pushed to GitHub
+1. Fresh EC2 instance launched (Ubuntu 22.04 or 24.04 LTS)
+2. Security group allows SSH (22), HTTP (80), HTTPS (443)
+3. SSH key pair to access EC2
+4. Repository pushed to GitHub
 
 **What GitHub Actions will do automatically:**
-- Install Node.js (via NVM), PostgreSQL, Nginx, PM2
-- Setup database and user
+- Install NVM and Node.js LTS
+- Install PM2 for process management
+- Install and configure Nginx
 - Clone repository
-- Run database migrations
-- Deploy backend and frontend
-- Configure Nginx as reverse proxy
-- Start services with PM2
+- Deploy backend (detects server.js location automatically)
+- Deploy frontend with build
+- Configure Nginx as reverse proxy with API forwarding
+- Start services with PM2 and health checks
 
 **→ Follow [Complete Setup for Fresh EC2](#complete-setup-for-fresh-ec2-instance)**
 
@@ -57,16 +59,16 @@ The GitHub Actions workflow automatically deploys your application whenever you 
 ### Prerequisites
 
 1. **Launch EC2 Instance**
-   - AMI: Ubuntu 22.04 LTS
+   - AMI: Ubuntu 22.04 or 24.04 LTS
    - Instance Type: t2.micro or larger
    - Storage: 8GB minimum (20GB recommended)
    
 2. **Configure Security Group**
    ```
    Inbound Rules:
-   - SSH (22)    - Your IP only (for security)
+   - SSH (22)    - Your IP (or 0.0.0.0/0 for GitHub Actions)
    - HTTP (80)   - 0.0.0.0/0
-   - HTTPS (443) - 0.0.0.0/0
+   - HTTPS (443) - 0.0.0.0/0 (optional, for future SSL)
    ```
 
 3. **Connect to EC2**
@@ -74,28 +76,28 @@ The GitHub Actions workflow automatically deploys your application whenever you 
    ssh -i your-key.pem ubuntu@YOUR_EC2_IP
    ```
 
-### Step 1: Run Minimal Setup Script
+**Note:** The workflow automatically installs NVM, Node.js, PM2, and Nginx. No manual installation needed!
 
-On your **fresh EC2 instance**, run:
+### Step 1: Prepare EC2 Instance
+
+On your **fresh EC2 instance**, you only need to ensure basic connectivity:
 
 ```bash
-# Update system and install Git
-sudo apt update && sudo apt install -y git
+# Update system (optional but recommended)
+sudo apt update
 
-# Clone your repository temporarily (to get the setup script)
-git clone https://github.com/md-sarowar-alam/single-server-3tier-webapp-github-actions.git temp-repo
-cd temp-repo
-
-# Run the minimal setup script
-chmod +x scripts/initial-ec2-setup.sh
-./scripts/initial-ec2-setup.sh
-
-# Clean up temporary clone
-cd ~
-rm -rf temp-repo
+# Verify you can connect
+whoami
+pwd
 ```
 
-This script only installs Git and configures SSH. **Everything else will be done by GitHub Actions!**
+**That's it!** GitHub Actions will install:
+- NVM (Node Version Manager)
+- Node.js LTS
+- PM2 (Process Manager)
+- Nginx (Web Server)
+
+No manual installation required!
 
 ### Step 2: Setup GitHub Actions SSH Key
 
@@ -149,11 +151,7 @@ cat ~/.ssh/github-actions-key
 ```
 Copy **everything** including `-----BEGIN` and `-----END` lines.
 
-#### 4. `DB_PASSWORD`
-Choose a strong password for PostgreSQL database:
-```
-Example: MySecureDBPassword123!
-```
+**Note:** `DB_PASSWORD` is optional. Only add it if you plan to enable database migration features in the future.
 
 ### Step 4: Push Code to Trigger Deployment
 
@@ -171,7 +169,7 @@ git push origin main
 3. Click on the running workflow "Deploy to AWS EC2"
 4. Watch the deployment progress in real-time
 
-The first deployment will take **5-10 minutes** as it installs all software.
+The first deployment will take **3-5 minutes** as it installs NVM, Node.js, PM2, and Nginx.
 
 ### Step 6: Verify Deployment
 
@@ -185,7 +183,7 @@ http://YOUR_EC2_IP
 http://YOUR_EC2_IP/api/health
 ```
 
-**Congratulations! 🎉** Your application is now deployed and future updates will happen automatically!
+**Congratulations!** Your application is now deployed and future updates will happen automatically!
 
 ---
 
@@ -377,21 +375,20 @@ The workflow automatically adds the host to known_hosts. If this fails:
 - Ensure EC2 security group allows SSH (port 22)
 - Verify the EC2_HOST secret is correct (44.245.64.25)
 
-### Issue: "npm command not found"
+### Issue: "npm command not found" or "pm2 command not found"
 
 **Solution:**
-- Ensure NVM is installed on the server
-- The workflow loads NVM before running npm commands
-- Verify Node.js is installed: `node --version`
-
-### Issue: "pm2 command not found"
-
-**Solution:**
-Install PM2 globally on the server:
-```bash
-npm install -g pm2
-pm2 startup
-```
+The workflow automatically installs NVM, Node.js, and PM2. If you see this error:
+- Re-run the workflow (it will detect and install missing components)
+- SSH to EC2 and verify: `which node` and `which pm2`
+- Check the "Install Prerequisites" step in the workflow logs
+- Manually verify NVM is loaded:
+  ```bash
+  export NVM_DIR="$HOME/.nvm"
+  [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+  node --version
+  pm2 --version
+  ```
 
 ### Issue: Frontend not updating
 
@@ -404,18 +401,23 @@ pm2 startup
 ### Issue: Backend health check fails
 
 **Solution:**
-- Check PM2 logs: `pm2 logs bmi-backend`
-- Verify .env file exists: `cat ~/single-server-3tier-webapp/backend/.env`
-- Check database connection: `psql -U bmi_user -d bmidb -c '\dt'`
+- Check PM2 logs: `pm2 logs bmi-backend --lines 50`
+- Verify server.js location (workflow auto-detects `src/server.js` or `server.js`)
+- Check if process is running: `pm2 status`
+- Test health endpoint directly: `curl http://localhost:3000/health`
 - Restart backend manually: `pm2 restart bmi-backend`
+- Check backend directory: `ls -la ~/single-server-3tier-webapp/backend/`
 
-### Issue: Database migrations fail
+### Issue: Nginx not found or frontend not deploying
 
 **Solution:**
-- Ensure DATABASE_URL is set in backend/.env
-- Check PostgreSQL is running: `sudo systemctl status postgresql`
-- Verify database credentials
-- Manually test migration: `psql -U bmi_user -d bmidb -f migrations/001_create_measurements.sql`
+The workflow automatically installs Nginx. If deployment fails:
+- Check if Nginx is installed: `which nginx`
+- Verify Nginx is running: `sudo systemctl status nginx`
+- Check Nginx configuration: `sudo nginx -t`
+- View Nginx logs: `sudo tail -f /var/log/nginx/error.log`
+- Restart Nginx: `sudo systemctl restart nginx`
+- The workflow creates Nginx config automatically at `/etc/nginx/sites-available/bmi-health-tracker`
 
 ---
 
@@ -549,11 +551,13 @@ If you encounter issues:
 
 ## Summary
 
-✅ **GitHub Actions workflow created:** [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml)  
-✅ **Secrets configured:** EC2_HOST, EC2_USER, EC2_SSH_KEY  
-✅ **Deployment automated:** Push to `main` → automatic deployment  
-✅ **Manual deployment available:** Trigger from GitHub Actions UI  
-✅ **Health checks enabled:** Automatic verification after deployment  
-✅ **Backups automated:** Created before each deployment  
+**GitHub Actions workflow created:** [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml)  
+**Secrets configured:** EC2_HOST, EC2_USER, EC2_SSH_KEY  
+**Prerequisites automated:** NVM, Node.js, PM2, Nginx installed automatically  
+**Deployment automated:** Push to `main` → automatic deployment  
+**Manual deployment available:** Trigger from GitHub Actions UI  
+**Health checks enabled:** Automatic verification after deployment  
+**Backups automated:** Created before each deployment  
+**Nginx auto-configured:** Reverse proxy and static file serving  
 
-🎉 **Your CI/CD pipeline is ready!** Push your changes and watch the magic happen! 🚀
+**Your CI/CD pipeline is ready!** Push your changes and deployment happens automatically.
