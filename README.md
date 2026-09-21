@@ -103,7 +103,7 @@ BMI & Health Tracker is a comprehensive health monitoring application that helps
 │ Backend Processing                   │
 │ 1. Validate inputs                   │
 │ 2. Calculate BMI = weight/height²    │
-│ 3. Calculate BMR (Mifflin-St Jeor)  │
+│ 3. Calculate BMR (Mifflin-St Jeor)   │
 │ 4. Calculate Daily Calories          │
 │ 5. Determine BMI Category            │
 └──────┬───────────────────────────────┘
@@ -164,42 +164,42 @@ Daily Calories = BMR × Activity Multiplier
 ### Three-Tier Application Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     PRESENTATION TIER                        │
+┌────────────────────────────────────────────────────────────┐
+│                     PRESENTATION TIER                      │
 │  ┌─────────────────────────────────────────────────────┐   │
-│  │   React 18.2 + Vite 5.0 (Single Page App)          │   │
+│  │   React 18.2 + Vite 5.0 (Single Page App)           │   │
 │  │   - MeasurementForm.jsx (User Input)                │   │
 │  │   - TrendChart.jsx (Chart.js Visualization)         │   │
 │  │   - App.jsx (Main Component)                        │   │
 │  │   - api.js (Axios HTTP Client)                      │   │
-│  │   Port: 5173 (dev) | 80/443 via Nginx (prod)       │   │
+│  │   Port: 5173 (dev) | 80/443 via Nginx (prod)        │   │
 │  └─────────────────────────────────────────────────────┘   │
-└────────────────────────┬────────────────────────────────────┘
+└────────────────────────┬───────────────────────────────────┘
                          │ HTTP REST API
                          │ /api/measurements, /api/measurements/stats, etc.
-┌────────────────────────▼────────────────────────────────────┐
-│                     APPLICATION TIER                         │
+┌────────────────────────▼───────────────────────────────────┐
+│                     APPLICATION TIER                       │
 │  ┌─────────────────────────────────────────────────────┐   │
-│  │   Node.js + Express 4.18 REST API (PM2 managed)    │   │
-│  │   - routes.js (API Endpoints)                        │   │
-│  │   - calculations.js (BMI/BMR Logic)                  │   │
-│  │   - server.js (Express App)                          │   │
+│  │   Node.js + Express 4.18 REST API (PM2 managed)     │   │
+│  │   - routes.js (API Endpoints)                       │   │
+│  │   - calculations.js (BMI/BMR Logic)                 │   │
+│  │   - server.js (Express App)                         │   │
 │  │   - db.js (PostgreSQL Connection Pool)              │   │
 │  │   Port: 3000 (PM2 process: bmi-backend)             │   │
 │  └─────────────────────────────────────────────────────┘   │
-└────────────────────────┬────────────────────────────────────┘
+└────────────────────────┬───────────────────────────────────┘
                          │ PostgreSQL Protocol
                          │ Connection Pool (max 20 connections)
 ┌────────────────────────▼────────────────────────────────────┐
-│                        DATA TIER                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │   PostgreSQL 12+ Database                           │   │
-│  │   - Database: bmidb                                  │   │
-│  │   - User: bmi_user                                   │   │
-│  │   - Table: measurements (11 columns)                 │   │
-│  │   - Indexes: date, created_at, BMI                   │   │
-│  │   Port: 5432 (localhost only, not exposed)          │   │
-│  └─────────────────────────────────────────────────────┘   │
+│                        DATA TIER                            │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │   PostgreSQL 12+ Database                           │    │
+│  │   - Database: bmidb                                 │    │
+│  │   - User: bmi_user                                  │    │
+│  │   - Table: measurements (11 columns)                │    │
+│  │   - Indexes: date, created_at, BMI                  │    │
+│  │   Port: 5432 (localhost only, not exposed)          │    │
+│  └─────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -211,20 +211,20 @@ Daily Calories = BMR × Activity Multiplier
          ┌──────────────────────────────────────┐
          │   AWS Security Group (Firewall)      │
          │   - Port 22 (SSH) - Your IP only     │
-         │   - Port 80 (HTTP) - 0.0.0.0/0      │
-         │   - Port 443 (HTTPS) - 0.0.0.0/0    │
+         │   - Port 80 (HTTP) - 0.0.0.0/0       │
+         │   - Port 443 (HTTPS) - 0.0.0.0/0     │
          └──────────────────┬───────────────────┘
                             ↓
     ┌────────────────────────────────────────────────┐
     │      EC2 Instance (Ubuntu 22.04 LTS)           │
-    │                                                 │
+    │                                                │
     │  ┌──────────────────────────────────────────┐  │
     │  │ Nginx Web Server (Port 80/443)           │  │
     │  │ - Serves /var/www/bmi-health-tracker/    │  │
     │  │ - Reverse proxy /api/* → localhost:3000  │  │
     │  │ - SSL/TLS with Certbot (optional)        │  │
     │  └─────────────┬────────────────────────────┘  │
-    │                │                                │
+    │                │                               │
     │  ┌─────────────▼────────────────────────────┐  │
     │  │ PM2 Process Manager                      │  │
     │  │ - Process name: bmi-backend              │  │
@@ -232,7 +232,7 @@ Daily Calories = BMR × Activity Multiplier
     │  │ - Startup on system reboot               │  │
     │  │ - Log management (error.log, out.log)    │  │
     │  └─────────────┬────────────────────────────┘  │
-    │                │                                │
+    │                │                               │
     │  ┌─────────────▼────────────────────────────┐  │
     │  │ Express API Server (Port 3000)           │  │
     │  │ - REST API endpoints                     │  │
@@ -240,7 +240,7 @@ Daily Calories = BMR × Activity Multiplier
     │  │ - CORS middleware                        │  │
     │  │ - PostgreSQL connection pool             │  │
     │  └─────────────┬────────────────────────────┘  │
-    │                │                                │
+    │                │                               │
     │  ┌─────────────▼────────────────────────────┐  │
     │  │ PostgreSQL Database (Port 5432)          │  │
     │  │ - Database: bmidb                        │  │
@@ -248,17 +248,17 @@ Daily Calories = BMR × Activity Multiplier
     │  │ - Listens only on localhost              │  │
     │  │ - Connection pooling enabled             │  │
     │  └──────────────────────────────────────────┘  │
-    │                                                 │
-    │  GitHub Actions (CI/CD Pipeline)                │
-    │  - SSH connection for automated deployment      │
-    │  - Smart detection (first-time vs update)       │
-    │  - Automatic backups before updates             │
-    └─────────────────────────────────────────────────┘
+    │                                                │
+    │  GitHub Actions (CI/CD Pipeline)               │
+    │  - SSH connection for automated deployment     │
+    │  - Smart detection (first-time vs update)      │
+    │  - Automatic backups before updates            │
+    └────────────────────────────────────────────────┘
 ```
 
 ### Data Flow
 │  └─────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
+└────────────────────────────────────────────────────────────┘
 ```
 
 ### Technology Stack by Tier
