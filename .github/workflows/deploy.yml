@@ -21,442 +21,646 @@ on:
         type: boolean
         default: false
 
-env:
-  DEPLOY_PATH: /home/ubuntu/single-server-3tier-webapp
-  FRONTEND_DEPLOY_PATH: /var/www/bmi-health-tracker
-  DB_NAME: bmidb
-  DB_USER: bmi_user
-  NODE_VERSION: 'lts/*'
+permissions:
+  contents: read
+
+# Two deploys must never touch the same server at once.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   deploy:
-    #runs-on: ubuntu-latest
-    ##runs-on: [self-hosted, Linux, X64]
     runs-on: self-hosted
-    
+    timeout-minutes: 25
+    env:
+      DEPLOY_PATH: /home/ubuntu/single-server-3tier-webapp
+      FRONTEND_DEPLOY_PATH: /var/www/bmi-health-tracker
+      DB_NAME: bmidb
+      DB_USER: bmi_user
+      NODE_VERSION: 'lts/*'
+      EC2_HOST: ${{ secrets.EC2_HOST }}
+      EC2_USER: ${{ secrets.EC2_USER }}
+      DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+      GIT_SHA: ${{ github.sha }}
+      REPO: ${{ github.repository }}
+      BACKEND_ONLY: ${{ inputs.backend_only || 'false' }}
+      FRONTEND_ONLY: ${{ inputs.frontend_only || 'false' }}
+      SKIP_HEALTH_CHECK: ${{ inputs.skip_health_check || 'false' }}
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Setup SSH
-      uses: webfactory/ssh-agent@v0.9.0
-      with:
-        ssh-private-key: ${{ secrets.EC2_SSH_KEY }}
-        log-public-key: true
-
-    - name: Configure SSH to skip host key checking
+    # ------------------------------------------------------------------
+    # Every remote step runs through remote_run (defined in "prepare").
+    # A step only passes when the remote script exits 0 AND prints its
+    # STEP_OK:<name> sentinel, so a script that silently stops early fails.
+    # Each task prints [PASS], [CHANGED] or [UNCHANGED] with its evidence.
+    # ------------------------------------------------------------------
+    - name: Validate inputs and secrets
+      id: guard
+      env:
+        EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
       run: |
-        mkdir -p ~/.ssh
-        cat >> ~/.ssh/config <<EOF
-        Host ${{ secrets.EC2_HOST }}
-          StrictHostKeyChecking no
-          UserKnownHostsFile /dev/null
-        EOF
-        chmod 600 ~/.ssh/config
+        fail=0
+        for v in EC2_HOST EC2_USER EC2_SSH_KEY DB_PASSWORD; do
+          if [ -z "${!v:-}" ]; then
+            echo "::error::Required secret $v is empty or not set"
+            fail=1
+          fi
+        done
+        if [ "$BACKEND_ONLY" = "true" ] && [ "$FRONTEND_ONLY" = "true" ]; then
+          echo "::error::backend_only and frontend_only cannot both be true"
+          fail=1
+        fi
+        [[ "$EC2_HOST" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::EC2_HOST has unexpected characters"; fail=1; }
+        [[ "$EC2_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo "::error::EC2_USER has unexpected characters"; fail=1; }
+        [[ "$DB_NAME" =~ ^[a-z_][a-z0-9_]*$ ]] || { echo "::error::DB_NAME must be a plain lowercase identifier"; fail=1; }
+        [[ "$DB_USER" =~ ^[a-z_][a-z0-9_]*$ ]] || { echo "::error::DB_USER must be a plain lowercase identifier"; fail=1; }
+        [ "$fail" = 0 ] || exit 1
+        echo "[PASS] secrets present, inputs valid (backend_only=$BACKEND_ONLY frontend_only=$FRONTEND_ONLY skip_health_check=$SKIP_HEALTH_CHECK)"
+        echo "[PASS] deploying commit $GIT_SHA"
 
-    - name: Test SSH Connection
+    - name: Prepare SSH and remote-exec helper
+      id: prepare
+      env:
+        EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
       run: |
-        ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "echo 'SSH connection successful'"
+        umask 077
+        work="$RUNNER_TEMP/deploy-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        rm -rf "$work"
+        mkdir -p "$work"
+        printf '%s\n' "$EC2_SSH_KEY" | tr -d '\r' > "$work/key"
+        chmod 600 "$work/key"
+        ssh-keygen -y -f "$work/key" > /dev/null || { echo "::error::EC2_SSH_KEY is not a valid private key"; exit 1; }
+        echo "[PASS] SSH private key parses"
 
-    - name: Get Runner Public IP
-      run: |
-        echo "=========================================="
-        echo "Runner Public IP Information"
-        echo "=========================================="
-        RUNNER_IP=$(curl -s http://api.ipify.org/?format=text)
-        echo "Runner Public IP: $RUNNER_IP"
-        echo "runner_ip=$RUNNER_IP" >> $GITHUB_OUTPUT        
+        ssh-keyscan -T 10 -t ed25519,ecdsa,rsa "$EC2_HOST" > "$work/known_hosts" 2> /dev/null || true
+        [ -s "$work/known_hosts" ] || { echo "::error::Could not read the SSH host key of $EC2_HOST (port 22 reachable? security group?)"; exit 1; }
+        echo "[PASS] host key fetched:"
+        ssh-keygen -lf "$work/known_hosts"
 
-    - name: Install Prerequisites (if needed)
-      run: |
-        ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << "ENDSSH"
+        {
+          echo "WORK_DIR=$work"
+          echo "SSH_KEY_FILE=$work/key"
+          echo "KNOWN_HOSTS_FILE=$work/known_hosts"
+          echo "REPORT_FILE=$work/report.log"
+          echo "REMOTE_LIB=$work/remote-lib.sh"
+        } >> "$GITHUB_ENV"
+        : > "$work/report.log"
+
+        cat > "$work/remote-lib.sh" <<'LIB'
+        SSH_OPTS=(-T -i "$SSH_KEY_FILE" -o BatchMode=yes -o IdentitiesOnly=yes
+          -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" -o StrictHostKeyChecking=yes
+          -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o LogLevel=ERROR)
+
+        # Helpers prepended to every remote script.
+        remote_prelude() {
+        cat <<'PRELUDE'
+        on_err() { printf '[FAIL] line %s: %s\n' "${BASH_LINENO[0]}" "$BASH_COMMAND" >&2; }
+        trap on_err ERR
+        pass()      { printf '[PASS] %s\n' "$*"; }
+        changed()   { printf '[CHANGED] %s\n' "$*"; }
+        unchanged() { printf '[UNCHANGED] %s\n' "$*"; }
+        die()       { printf '[FAIL] %s\n' "$*" >&2; exit 1; }
+        step_ok()   { printf 'STEP_OK:%s\n' "$1"; }
+        export GIT_TERMINAL_PROMPT=0
+
+        # nvm is not compatible with -e/-u or the ERR trap, so relax them around it.
+        load_nvm() {
+          export NVM_DIR="$HOME/.nvm"
+          [ -s "$NVM_DIR/nvm.sh" ] || return 1
+          set +eu; trap - ERR
+          . "$NVM_DIR/nvm.sh"
+          set -eu; trap on_err ERR
+          return 0
+        }
+        nvm_do() {
+          local rc=0
+          set +eu; trap - ERR
+          nvm "$@" || rc=$?
+          set -eu; trap on_err ERR
+          return "$rc"
+        }
+        use_node() {
+          load_nvm || die "nvm is not installed"
+          nvm_do use --silent default > /dev/null || die "no default Node.js is set in nvm"
+          node --version > /dev/null || die "node is installed but does not run"
+        }
+        PRELUDE
+        }
+
+        remote_run() {
+          local name="$1" log ssh_rc
+          log="$(mktemp)"
+          echo "---- [${name}] running on ${EC2_USER}@${EC2_HOST} ----"
+          set +e
+          {
+            printf 'export DEPLOY_PATH=%q FRONTEND_DEPLOY_PATH=%q DB_NAME=%q DB_USER=%q NODE_VERSION=%q GIT_SHA=%q REPO=%q BACKEND_ONLY=%q FRONTEND_ONLY=%q DB_PASSWORD=%q\n' \
+              "$DEPLOY_PATH" "$FRONTEND_DEPLOY_PATH" "$DB_NAME" "$DB_USER" "$NODE_VERSION" "$GIT_SHA" "$REPO" "$BACKEND_ONLY" "$FRONTEND_ONLY" "$DB_PASSWORD"
+            remote_prelude
+            cat
+          } | ssh "${SSH_OPTS[@]}" "${EC2_USER}@${EC2_HOST}" 'p="$(cat)"; exec bash -Eeuo pipefail -c "$p" </dev/null' 2>&1 | tee "$log"
+          ssh_rc=${PIPESTATUS[1]}
           set -e
-          
-          echo "=========================================="
-          echo "Installing/Verifying Prerequisites"
-          echo "=========================================="
-          
-          # Function to install NVM if not present
-          install_nvm() {
-            if [ ! -d "$HOME/.nvm" ]; then
-              echo "Installing NVM..."
-              curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
-              export NVM_DIR="$HOME/.nvm"
-              [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-              echo "NVM installed"
-            else
-              echo "NVM already installed"
-            fi
-          }
-          
-          # Function to load NVM
-          load_nvm() {
-            export NVM_DIR="$HOME/.nvm"
-            [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-          }
-          
-          # Install NVM
-          install_nvm
-          
-          # Load NVM
-          load_nvm
-          
-          # Install Node.js if not present
-          if ! command -v node &> /dev/null; then
-            echo "Installing Node.js ${{ env.NODE_VERSION }}..."
-            nvm install ${{ env.NODE_VERSION }}
-            nvm use ${{ env.NODE_VERSION }}
-            nvm alias default ${{ env.NODE_VERSION }}
-            echo "Node.js $(node --version) installed"
-          else
-            echo "Node.js $(node --version) already installed"
-            nvm install ${{ env.NODE_VERSION }}
-            nvm use ${{ env.NODE_VERSION }}
+          grep -E '^\[(PASS|CHANGED|UNCHANGED|FAIL)\] ' "$log" | sed "s/^/${name}: /" >> "$REPORT_FILE" || true
+          if [ "$ssh_rc" -ne 0 ]; then
+            echo "::error::[${name}] remote script failed (exit ${ssh_rc}); tasks after the failure did not run"
+            rm -f "$log"
+            return 1
           fi
-          
-          # Install PM2 if not present
-          if ! command -v pm2 &> /dev/null; then
-            echo "Installing PM2..."
-            npm install -g pm2
-            echo "PM2 installed"
-          else
-            echo "PM2 $(pm2 --version) already installed"
+          if ! grep -qx "STEP_OK:${name}" "$log"; then
+            echo "::error::[${name}] remote script ended without confirming completion (STEP_OK missing)"
+            rm -f "$log"
+            return 1
           fi
-          
-          # Install Nginx if not present
-          if ! command -v nginx &> /dev/null; then
-            echo "Installing Nginx..."
-            sudo apt update
-            sudo apt install -y nginx
-            sudo systemctl enable nginx
-            sudo systemctl start nginx
-            echo "Nginx installed and started"
-          else
-            echo "Nginx already installed"
-            sudo systemctl is-active nginx || sudo systemctl start nginx
-          fi
-          
-          # Verify installations
-          echo ""
-          echo "Installed versions:"
-          echo "  Node: $(node --version)"
-          echo "  npm: $(npm --version)"
-          echo "  PM2: $(pm2 --version)"
-          echo "  Nginx: $(nginx -v 2>&1 | cut -d/ -f2)"
-          echo ""
-        ENDSSH
+          rm -f "$log"
+          echo "---- [${name}] confirmed ----"
+        }
+        LIB
+        echo "[PASS] helper written to $work/remote-lib.sh"
 
-    - name: Check if deployment exists
-      id: check_deployment
+    - name: Connect to server
+      id: ssh
       run: |
-        DEPLOYMENT_EXISTS=$(ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "[ -d ${{ env.DEPLOY_PATH }} ] && echo 'true' || echo 'false'")
-        echo "exists=$DEPLOYMENT_EXISTS" >> $GITHUB_OUTPUT
-        echo "Deployment exists: $DEPLOYMENT_EXISTS"
+        source "$REMOTE_LIB"
+        remote_run ssh <<'REMOTE'
+        . /etc/os-release
+        printf 'host=%s user=%s os=%s\n' "$(hostname)" "$(id -un)" "$PRETTY_NAME"
+        sudo -n true || die "passwordless sudo is required for $(id -un)"
+        pass "connected to $(hostname) as $(id -un) with passwordless sudo"
+        step_ok ssh
+        REMOTE
 
-    - name: Setup Database
+    - name: Install prerequisites
+      id: prereq
       run: |
-        ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << "ENDSSH"
-          set -e
-          
-          echo "=========================================="
-          echo "Setting up PostgreSQL Database"
-          echo "=========================================="
-          
-          # Check if PostgreSQL is installed
-          if ! command -v psql &> /dev/null; then
-            echo "Installing PostgreSQL..."
-            sudo apt update
-            sudo apt install -y postgresql postgresql-contrib
-            sudo systemctl enable postgresql
-            sudo systemctl start postgresql
-            echo "PostgreSQL installed and started"
+        source "$REMOTE_LIB"
+        remote_run prereq <<'REMOTE'
+        # --- system packages (only the missing ones) ---
+        pkgs=(git curl ca-certificates libatomic1 rsync nginx postgresql)
+        need=()
+        for p in "${pkgs[@]}"; do
+          dpkg -s "$p" > /dev/null 2>&1 || need+=("$p")
+        done
+        if [ "${#need[@]}" -gt 0 ]; then
+          sudo -n apt-get -o DPkg::Lock::Timeout=120 update -qq
+          sudo -n env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get -o DPkg::Lock::Timeout=120 install -y -qq "${need[@]}"
+          changed "installed packages: ${need[*]}"
+        else
+          unchanged "all system packages already installed"
+        fi
+        for p in "${pkgs[@]}"; do
+          dpkg -s "$p" > /dev/null 2>&1 || die "package $p is still missing after install"
+        done
+        pass "verified packages: ${pkgs[*]}"
+
+        # --- nginx and postgres services ---
+        sudo -n systemctl enable --now nginx postgresql > /dev/null 2>&1 || true
+        sudo -n systemctl is-active --quiet nginx || die "nginx is not active"
+        sudo -n systemctl is-active --quiet postgresql || die "postgresql is not active"
+        pass "nginx and postgresql services are active"
+
+        # --- nvm ---
+        if [ ! -s "$HOME/.nvm/nvm.sh" ]; then
+          curl -fsSL "https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh" -o /tmp/nvm-install.sh
+          bash /tmp/nvm-install.sh > /dev/null
+          rm -f /tmp/nvm-install.sh
+          changed "installed nvm v0.40.1"
+        else
+          unchanged "nvm already installed"
+        fi
+        load_nvm || die "nvm failed to load"
+
+        # --- node (never upgraded on re-run; only installed when missing or broken) ---
+        if nvm_do use --silent default > /dev/null 2>&1 && node --version > /dev/null 2>&1; then
+          unchanged "node $(node --version) already installed and working"
+        else
+          nvm_do install "$NODE_VERSION" > /dev/null
+          nvm_do alias default "$NODE_VERSION" > /dev/null
+          changed "installed node for $NODE_VERSION"
+        fi
+        use_node
+        pass "node $(node --version), npm $(npm --version)"
+
+        # --- pm2 ---
+        if command -v pm2 > /dev/null 2>&1 && pm2 --version > /dev/null 2>&1; then
+          unchanged "pm2 $(pm2 --version) already installed"
+        else
+          npm install -g pm2 --no-audit --no-fund > /dev/null
+          changed "installed pm2"
+        fi
+        pass "pm2 $(pm2 --version) runs"
+
+        # --- pm2 restarts the app after a reboot ---
+        unit="pm2-$(id -un)"
+        if systemctl is-enabled "$unit" > /dev/null 2>&1; then
+          unchanged "systemd unit $unit already enabled"
+        else
+          sudo -n env "PATH=$PATH" "$(command -v pm2)" startup systemd -u "$(id -un)" --hp "$HOME" > /dev/null
+          changed "created systemd unit $unit"
+        fi
+        systemctl is-enabled "$unit" > /dev/null 2>&1 || die "systemd unit $unit is not enabled"
+        pass "systemd unit $unit is enabled (app survives reboot)"
+        step_ok prereq
+        REMOTE
+
+    - name: Set up database
+      id: db
+      run: |
+        source "$REMOTE_LIB"
+        remote_run db <<'REMOTE'
+        cd /tmp
+        psql_admin() { sudo -n -u postgres psql -X -qAt -v ON_ERROR_STOP=1 "$@"; }
+
+        ready=0
+        for _ in $(seq 1 30); do
+          if pg_isready -q; then ready=1; break; fi
+          sleep 1
+        done
+        [ "$ready" = 1 ] || die "PostgreSQL did not accept connections within 30s"
+        pass "PostgreSQL is accepting connections"
+
+        if [ "$(psql_admin -c "SELECT 1 FROM pg_roles WHERE rolname = '${DB_USER}'")" != 1 ]; then
+          printf 'CREATE ROLE %s LOGIN;\n' "$DB_USER" | psql_admin
+          changed "created role $DB_USER"
+        else
+          unchanged "role $DB_USER exists"
+        fi
+
+        # Always sync so the role password can never drift from the DB_PASSWORD secret.
+        pwq=${DB_PASSWORD//\'/\'\'}
+        printf "ALTER ROLE %s WITH LOGIN PASSWORD '%s';\n" "$DB_USER" "$pwq" | psql_admin
+        pass "password of role $DB_USER synced with DB_PASSWORD"
+
+        if [ "$(psql_admin -c "SELECT 1 FROM pg_database WHERE datname = '${DB_NAME}'")" != 1 ]; then
+          sudo -n -u postgres createdb -O "$DB_USER" "$DB_NAME"
+          changed "created database $DB_NAME"
+        else
+          unchanged "database $DB_NAME exists"
+        fi
+
+        owner="$(psql_admin -c "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = '${DB_NAME}'")"
+        if [ "$owner" != "$DB_USER" ]; then
+          printf 'ALTER DATABASE %s OWNER TO %s;\n' "$DB_NAME" "$DB_USER" | psql_admin
+          changed "database owner set to $DB_USER (was $owner)"
+        else
+          unchanged "database owner is $DB_USER"
+        fi
+
+        who="$(PGPASSWORD="$DB_PASSWORD" psql -X -qAt -h 127.0.0.1 -U "$DB_USER" -d "$DB_NAME" -c 'SELECT current_user')" \
+          || die "cannot log in as $DB_USER over TCP with DB_PASSWORD (check pg_hba.conf)"
+        [ "$who" = "$DB_USER" ] || die "logged in as '$who', expected '$DB_USER'"
+        pass "logged in to $DB_NAME as $who over 127.0.0.1 using DB_PASSWORD"
+        step_ok db
+        REMOTE
+
+    - name: Back up current deployment
+      id: backup
+      run: |
+        source "$REMOTE_LIB"
+        remote_run backup <<'REMOTE'
+        BACKUP_DIR="$HOME/bmi_deployments_backup"
+        if [ ! -d "$DEPLOY_PATH/.git" ]; then
+          unchanged "no existing deployment at $DEPLOY_PATH (first deploy); nothing to back up"
+        else
+          prev="$(git -C "$DEPLOY_PATH" rev-parse HEAD 2>/dev/null || true)"
+          if [ "$prev" = "$GIT_SHA" ]; then
+            unchanged "deployment already at ${GIT_SHA:0:7}; no new backup needed"
           else
-            echo "PostgreSQL already installed"
-            sudo systemctl is-active postgresql || sudo systemctl start postgresql
+            mkdir -p "$BACKUP_DIR"
+            dest="$BACKUP_DIR/backup_$(date +%Y%m%d_%H%M%S)"
+            rsync -a --exclude node_modules "$DEPLOY_PATH/" "$dest/"
+            [ -d "$dest/.git" ] || die "backup at $dest is incomplete"
+            changed "backed up ${prev:0:7} to $dest"
           fi
-          
-          # Wait for PostgreSQL to be ready
-          echo "Waiting for PostgreSQL to be ready..."
-          for i in {1..30}; do
-            if sudo -u postgres psql -c '\q' 2>/dev/null; then
-              echo "PostgreSQL is ready"
-              break
-            fi
-            echo "Waiting... ($i/30)"
-            sleep 1
+        fi
+        mapfile -t old < <(ls -1dt "$BACKUP_DIR"/backup_* 2>/dev/null | tail -n +6 || true)
+        if [ "${#old[@]}" -gt 0 ]; then
+          rm -rf -- "${old[@]}"
+          changed "pruned ${#old[@]} old backup(s), kept the newest 5"
+        else
+          unchanged "backup retention ok (5 or fewer)"
+        fi
+        step_ok backup
+        REMOTE
+
+    - name: Sync code to this commit
+      id: code
+      run: |
+        source "$REMOTE_LIB"
+        remote_run code <<'REMOTE'
+        repo_url="https://github.com/${REPO}.git"
+        mkdir -p "$(dirname "$DEPLOY_PATH")"
+        if [ -d "$DEPLOY_PATH/.git" ]; then
+          action=update
+          git -C "$DEPLOY_PATH" remote set-url origin "$repo_url"
+        else
+          if [ -d "$DEPLOY_PATH" ] && [ -n "$(ls -A "$DEPLOY_PATH")" ]; then
+            die "$DEPLOY_PATH exists and is not a git checkout"
+          fi
+          action=clone
+          git clone --quiet --no-checkout "$repo_url" "$DEPLOY_PATH"
+        fi
+        cd "$DEPLOY_PATH"
+        before="$(git rev-parse HEAD 2>/dev/null || echo none)"
+        git fetch --quiet --prune origin "$GIT_SHA" 2>/dev/null \
+          || git fetch --quiet --prune origin '+refs/heads/*:refs/remotes/origin/*'
+        git checkout --quiet --force --detach "$GIT_SHA"
+        after="$(git rev-parse HEAD)"
+        [ "$after" = "$GIT_SHA" ] || die "HEAD is $after, expected $GIT_SHA"
+        if [ "$action" = clone ] || [ "$before" != "$after" ]; then
+          changed "checked out ${after:0:7} ($action; was ${before:0:7})"
+        else
+          unchanged "already at ${after:0:7}"
+        fi
+        pass "$(git log -1 --format='HEAD %h: %s')"
+        step_ok code
+        REMOTE
+
+    - name: Deploy backend
+      id: backend
+      if: env.FRONTEND_ONLY != 'true'
+      run: |
+        source "$REMOTE_LIB"
+        remote_run backend <<'REMOTE'
+        use_node
+        cd "$DEPLOY_PATH/backend"
+        [ -f src/server.js ] || die "backend/src/server.js not found in this commit"
+
+        npm install --omit=dev --no-audit --no-fund --no-progress > /dev/null
+        node -e "require('express'); require('pg'); require('dotenv'); require('cors'); require('body-parser')" \
+          || die "backend dependencies do not load after npm install"
+        pass "backend dependencies installed and load"
+
+        enc="$(node -e 'process.stdout.write(encodeURIComponent(process.env.DB_PASSWORD))')"
+        umask 077
+        tmp="$(mktemp .env.XXXXXX)"
+        printf 'DATABASE_URL=postgresql://%s:%s@localhost:5432/%s\nNODE_ENV=production\nPORT=3000\n' "$DB_USER" "$enc" "$DB_NAME" > "$tmp"
+        if [ -f .env ] && cmp -s "$tmp" .env; then
+          rm -f "$tmp"
+          unchanged ".env already up to date"
+        else
+          chmod 600 "$tmp"
+          mv -f "$tmp" .env
+          changed ".env written"
+        fi
+        [ "$(stat -c %a .env)" = 600 ] || chmod 600 .env
+        grep -q '^DATABASE_URL=postgresql://' .env && grep -q '^PORT=3000$' .env || die ".env is missing required keys"
+        pass ".env has DATABASE_URL and PORT, permissions $(stat -c %a .env)"
+
+        if ls migrations/*.sql > /dev/null 2>&1; then
+          for f in migrations/*.sql; do
+            PGPASSWORD="$DB_PASSWORD" psql -X -qAt -h 127.0.0.1 -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 -f "$f" > /dev/null \
+              || die "migration $f failed"
+            pass "migration $(basename "$f") applied (idempotent)"
           done
-          
-          # Create database user if not exists
-          echo "Setting up database user..."
-          sudo -u postgres psql -tc "SELECT 1 FROM pg_user WHERE usename = '${{ env.DB_USER }}'" | grep -q 1 || \
-            sudo -u postgres psql -c "CREATE USER ${{ env.DB_USER }} WITH PASSWORD '${{ secrets.DB_PASSWORD }}';"
-          
-          # Create database if not exists
-          echo "Setting up database..."
-          sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname = '${{ env.DB_NAME }}'" | grep -q 1 || \
-            sudo -u postgres psql -c "CREATE DATABASE ${{ env.DB_NAME }} OWNER ${{ env.DB_USER }};"
-          
-          # Grant privileges
-          sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE ${{ env.DB_NAME }} TO ${{ env.DB_USER }};"
-          
-          # Configure PostgreSQL for local connections
-          PG_VERSION=$(psql --version | awk '{print $3}' | cut -d. -f1)
-          PG_HBA="/etc/postgresql/${PG_VERSION}/main/pg_hba.conf"
-          
-          if ! sudo grep -q "host.*${{ env.DB_NAME }}.*${{ env.DB_USER }}" "$PG_HBA"; then
-            echo "Configuring PostgreSQL authentication..."
-            echo "host    ${{ env.DB_NAME }}    ${{ env.DB_USER }}    127.0.0.1/32    md5" | sudo tee -a "$PG_HBA" > /dev/null
-            sudo systemctl reload postgresql
-          fi
-          
-          echo "Database setup completed successfully"
-          echo ""
-        ENDSSH
+        else
+          unchanged "no migrations directory content"
+        fi
+        q() { PGPASSWORD="$DB_PASSWORD" psql -X -qAt -h 127.0.0.1 -U "$DB_USER" -d "$DB_NAME" -c "$1"; }
+        [ "$(q "SELECT to_regclass('public.measurements') IS NOT NULL")" = t ] || die "table measurements does not exist"
+        [ "$(q "SELECT count(*) FROM information_schema.columns WHERE table_name = 'measurements' AND column_name = 'measurement_date'")" = 1 ] \
+          || die "column measurements.measurement_date does not exist"
+        pass "schema verified: measurements table with measurement_date column"
 
-    - name: Create backup (if deployment exists)
-      if: steps.check_deployment.outputs.exists == 'true'
+        pm2_state() {
+          pm2 jlist 2>/dev/null | node -e '
+            let s = "";
+            process.stdin.on("data", d => s += d).on("end", () => {
+              const i = s.indexOf("[");
+              const list = JSON.parse(i >= 0 ? s.slice(i) : "[]");
+              const p = list.find(x => x.name === "bmi-backend");
+              console.log(p ? [p.pm2_env.status, p.pm2_env.restart_time, p.pm2_env.pm_cwd].join(" ") : "missing 0 -");
+            });'
+        }
+        pm2 delete bmi-backend > /dev/null 2>&1 || true
+        pm2 start src/server.js --name bmi-backend --cwd "$DEPLOY_PATH/backend" --time > /dev/null
+        pm2 save --force > /dev/null
+        read -r st1 rs1 cwd1 <<< "$(pm2_state)"
+        sleep 5
+        read -r st2 rs2 cwd2 <<< "$(pm2_state)"
+        if [ "$st2" != online ] || [ "$rs1" != "$rs2" ] || [ "$cwd2" != "$DEPLOY_PATH/backend" ]; then
+          pm2 logs bmi-backend --lines 40 --nostream 2>&1 || true
+          die "bmi-backend is not stable: status=$st2 restarts=$rs1->$rs2 cwd=$cwd2"
+        fi
+        pass "pm2 bmi-backend online for 5s with no restarts, cwd=$cwd2"
+        step_ok backend
+        REMOTE
+
+    - name: Deploy frontend and nginx
+      id: frontend
+      if: env.BACKEND_ONLY != 'true'
       run: |
-        TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-        ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << EOF
-          mkdir -p ~/bmi_deployments_backup
-          if [ -d "${{ env.DEPLOY_PATH }}" ]; then
-            echo "Creating backup..."
-            cp -r ${{ env.DEPLOY_PATH }} ~/bmi_deployments_backup/backup_${TIMESTAMP}
-            echo "Backup created at ~/bmi_deployments_backup/backup_${TIMESTAMP}"
-          fi
-        EOF
+        source "$REMOTE_LIB"
+        remote_run frontend <<'REMOTE'
+        use_node
+        cd "$DEPLOY_PATH/frontend"
+        npm install --no-audit --no-fund --no-progress > /dev/null
+        npm run build > /dev/null
+        [ -s dist/index.html ] || die "build did not produce dist/index.html"
+        pass "frontend built ($(find dist -type f | wc -l) files)"
 
-    - name: Deploy application
+        sudo -n mkdir -p "$FRONTEND_DEPLOY_PATH"
+        n="$(sudo -n rsync -rlt --delete --itemize-changes --chown=www-data:www-data --chmod=D755,F644 dist/ "$FRONTEND_DEPLOY_PATH/" | wc -l)"
+        if [ "$n" -gt 0 ]; then
+          changed "synced frontend to $FRONTEND_DEPLOY_PATH ($n change(s))"
+        else
+          unchanged "frontend files already identical to the build"
+        fi
+        [ "$(sha256sum < dist/index.html)" = "$(sha256sum < "$FRONTEND_DEPLOY_PATH/index.html")" ] \
+          || die "deployed index.html differs from the build"
+        pass "deployed index.html matches the build (sha256)"
+
+        cfg=/etc/nginx/sites-available/bmi-health-tracker
+        tmp="$(mktemp)"
+        cat > "$tmp" <<'NGINX'
+        server {
+            listen 80 default_server;
+            listen [::]:80 default_server;
+            server_name _;
+
+            root __ROOT__;
+            index index.html;
+
+            location / {
+                try_files $uri $uri/ /index.html;
+            }
+
+            location /api/ {
+                proxy_pass http://127.0.0.1:3000/api/;
+                proxy_http_version 1.1;
+                proxy_set_header Upgrade $http_upgrade;
+                proxy_set_header Connection 'upgrade';
+                proxy_set_header Host $host;
+                proxy_cache_bypass $http_upgrade;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                proxy_read_timeout 60s;
+            }
+        }
+        NGINX
+        sed -i "s#__ROOT__#${FRONTEND_DEPLOY_PATH}#" "$tmp"
+
+        reload=0
+        if sudo -n cmp -s "$tmp" "$cfg"; then
+          unchanged "nginx site config already up to date"
+        else
+          sudo -n install -m 644 "$tmp" "$cfg"
+          reload=1
+          changed "nginx site config written to $cfg"
+        fi
+        rm -f "$tmp"
+        if [ "$(readlink /etc/nginx/sites-enabled/bmi-health-tracker 2>/dev/null || true)" != "$cfg" ]; then
+          sudo -n ln -sfn "$cfg" /etc/nginx/sites-enabled/bmi-health-tracker
+          reload=1
+          changed "enabled nginx site bmi-health-tracker"
+        else
+          unchanged "nginx site already enabled"
+        fi
+        if [ -e /etc/nginx/sites-enabled/default ] || [ -L /etc/nginx/sites-enabled/default ]; then
+          sudo -n rm -f /etc/nginx/sites-enabled/default
+          reload=1
+          changed "removed nginx default site"
+        else
+          unchanged "nginx default site already removed"
+        fi
+        sudo -n nginx -t
+        pass "nginx -t reports a valid configuration"
+        if [ "$reload" = 1 ]; then
+          sudo -n systemctl reload nginx
+          changed "nginx reloaded"
+        else
+          unchanged "nginx reload not needed"
+        fi
+        sudo -n systemctl is-active --quiet nginx || die "nginx is not active"
+        pass "nginx is active"
+        step_ok frontend
+        REMOTE
+
+    - name: Health check
+      id: health
+      if: env.SKIP_HEALTH_CHECK != 'true'
       run: |
-        ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << "ENDSSH"
-          set -e
-          
-          # Load NVM
-          export NVM_DIR="$HOME/.nvm"
-          [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-          
-          # Use Node LTS
-          nvm use ${{ env.NODE_VERSION }}
-          
-          echo "=========================================="
-          echo "Deploying Application"
-          echo "=========================================="
-          echo "Node: $(node --version)"
-          echo "npm: $(npm --version)"
-          echo ""
-          
-          # Clone or pull repository
-          if [ ! -d "${{ env.DEPLOY_PATH }}" ]; then
-            echo "Fresh deployment - cloning repository..."
-            git clone https://github.com/${{ github.repository }}.git ${{ env.DEPLOY_PATH }}
-          else
-            echo "Updating existing deployment..."
-            cd ${{ env.DEPLOY_PATH }}
-            git fetch origin
-            git reset --hard origin/main
-          fi
-          
-          cd ${{ env.DEPLOY_PATH }}
-          
-          # Deploy backend
-          if [ "${{ github.event.inputs.frontend_only }}" != "true" ]; then
-            echo ""
-            echo "=========================================="
-            echo "Deploying Backend"
-            echo "=========================================="
-            cd backend
-            
-            # Install dependencies
-            echo "Installing backend dependencies..."
-            npm install
-            
-            # Setup environment variables
-            echo "Setting up environment variables..."
-            echo "DATABASE_URL=postgresql://${{ env.DB_USER }}:${{ secrets.DB_PASSWORD }}@localhost:5432/${{ env.DB_NAME }}" > .env
-            echo "NODE_ENV=production" >> .env
-            echo "PORT=3000" >> .env
-            
-            # Run migrations if they exist
-            if [ -d "migrations" ]; then
-              echo "Running database migrations..."
-              for migration in migrations/*.sql; do
-                if [ -f "$migration" ]; then
-                  echo "Running $(basename $migration)..."
-                  PGPASSWORD='${{ secrets.DB_PASSWORD }}' psql -h localhost -U ${{ env.DB_USER }} -d ${{ env.DB_NAME }} -f "$migration" || true
-                fi
-              done
-              echo "Migrations completed"
+        source "$REMOTE_LIB"
+        remote_run health <<'REMOTE'
+        use_node
+        diag() {
+          echo "---- pm2 ----"
+          pm2 describe bmi-backend 2>&1 | head -40 || true
+          echo "---- backend logs (last 50 lines) ----"
+          pm2 logs bmi-backend --lines 50 --nostream 2>&1 || true
+          echo "---- listeners on 80/3000 ----"
+          ss -ltnp 2>/dev/null | grep -E ':(80|3000)\s' || echo "nothing is listening on 80 or 3000"
+          echo "---- nginx -t ----"
+          sudo -n nginx -t 2>&1 || true
+          echo "---- nginx journal (last 30 lines) ----"
+          sudo -n journalctl -u nginx -n 30 --no-pager 2>&1 || true
+        }
+        wait_for_200() {
+          local url="$1" code=000
+          for i in $(seq 1 30); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$url" || true)"
+            if [ "$code" = 200 ]; then
+              echo "$url -> HTTP 200 (attempt $i)"
+              return 0
             fi
-            
-            # Check if server.js exists in src/ directory
-            if [ -f "src/server.js" ]; then
-              SERVER_FILE="src/server.js"
-            elif [ -f "server.js" ]; then
-              SERVER_FILE="server.js"
-            else
-              echo "Error: server.js not found in backend/ or backend/src/"
-              exit 1
-            fi
-            
-            echo "Using server file: $SERVER_FILE"
-            
-            # Restart backend with PM2
-            if pm2 describe bmi-backend > /dev/null 2>&1; then
-              echo "Restarting existing PM2 process..."
-              pm2 restart bmi-backend --update-env
-            else
-              echo "Starting new PM2 process..."
-              pm2 start $SERVER_FILE --name bmi-backend
-              pm2 save
-            fi
-            
-            echo "Backend deployed successfully"
-            cd ..
-          fi
-          
-          # Deploy frontend
-          if [ "${{ github.event.inputs.backend_only }}" != "true" ]; then
-            echo ""
-            echo "=========================================="
-            echo "Deploying Frontend"
-            echo "=========================================="
-            cd frontend
-            
-            # Install dependencies
-            echo "Installing frontend dependencies..."
-            npm install
-            
-            # Build frontend
-            echo "Building frontend..."
-            npm run build
-            
-            # Check if Nginx is installed
-            if ! command -v nginx &> /dev/null; then
-              echo "Warning: Nginx not found. Skipping frontend deployment."
-              echo "Please install Nginx manually or re-run the prerequisite installation."
-              cd ..
-              exit 0
-            fi
-            
-            # Deploy to Nginx
-            echo "Deploying to Nginx..."
-            sudo mkdir -p ${{ env.FRONTEND_DEPLOY_PATH }}
-            sudo cp -r dist/* ${{ env.FRONTEND_DEPLOY_PATH }}/
-            sudo chown -R www-data:www-data ${{ env.FRONTEND_DEPLOY_PATH }}
-            
-            # Configure Nginx
-            echo "Creating Nginx configuration..."
-            printf '%s\n' \
-              'server {' \
-              '    listen 80;' \
-              '    server_name _;' \
-              '' \
-              '    root /var/www/bmi-health-tracker;' \
-              '    index index.html;' \
-              '' \
-              '    location / {' \
-              '        try_files $uri $uri/ /index.html;' \
-              '    }' \
-              '' \
-              '    location /api/ {' \
-              '        proxy_pass http://127.0.0.1:3000/api/;' \
-              '        proxy_http_version 1.1;' \
-              '        proxy_set_header Upgrade $http_upgrade;' \
-              '        proxy_set_header Connection '"'"'upgrade'"'"';' \
-              '        proxy_set_header Host $host;' \
-              '        proxy_cache_bypass $http_upgrade;' \
-              '        proxy_set_header X-Real-IP $remote_addr;' \
-              '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;' \
-              '    }' \
-              '}' | sudo tee /etc/nginx/sites-available/bmi-health-tracker > /dev/null
-            
-            sudo ln -sf /etc/nginx/sites-available/bmi-health-tracker /etc/nginx/sites-enabled/
-            sudo rm -f /etc/nginx/sites-enabled/default
-            
-            # Test Nginx config
-            sudo nginx -t
-            
-            # Reload Nginx
-            sudo systemctl reload nginx
-            
-            echo "Frontend deployed successfully"
-            cd ..
-          fi
-          
-          echo ""
-          echo "=========================================="
-          echo "Deployment Completed Successfully"
-          echo "=========================================="
-          echo ""
-        ENDSSH
+            echo "attempt $i/30: $url -> HTTP $code"
+            sleep 2
+          done
+          return 1
+        }
 
-    - name: Health Check
-      if: github.event.inputs.skip_health_check != 'true'
+        wait_for_200 http://127.0.0.1:3000/health || { diag; die "backend /health did not return 200 within 60s"; }
+        body="$(curl -fsS --max-time 5 http://127.0.0.1:3000/health)"
+        case "$body" in
+          *'"status":"ok"'*) pass "backend /health body: $body" ;;
+          *) diag; die "backend /health returned unexpected body: $body" ;;
+        esac
+
+        wait_for_200 http://127.0.0.1/ || { diag; die "nginx did not serve the frontend (HTTP 200) within 60s"; }
+        page="$(curl -fsS --max-time 5 http://127.0.0.1/)"
+        [[ "${page,,}" == *"<!doctype html"* ]] || { diag; die "nginx / did not return an HTML page"; }
+        pass "nginx serves the frontend HTML"
+
+        wait_for_200 http://127.0.0.1/api/measurements || { diag; die "/api/measurements via nginx did not return 200 within 60s"; }
+        pass "nginx proxies /api/ to the backend and the database answers"
+        step_ok health
+        REMOTE
+
+        code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://${EC2_HOST}/" || true)"
+        if [ "$code" = 200 ]; then
+          echo "[PASS] public check from the runner: http://<EC2_HOST>/ returned HTTP 200"
+          echo "health: [PASS] public check from the runner returned HTTP 200" >> "$REPORT_FILE"
+        else
+          echo "::warning::Public check from the runner got HTTP ${code} for http://<EC2_HOST>/ (server-side checks passed; check the security group or the EC2_HOST value)"
+          echo "health: [WARN] public check from the runner got HTTP ${code}" >> "$REPORT_FILE"
+        fi
+
+    - name: Deployment summary
+      if: always()
+      env:
+        O_GUARD: ${{ steps.guard.outcome }}
+        O_PREPARE: ${{ steps.prepare.outcome }}
+        O_SSH: ${{ steps.ssh.outcome }}
+        O_PREREQ: ${{ steps.prereq.outcome }}
+        O_DB: ${{ steps.db.outcome }}
+        O_BACKUP: ${{ steps.backup.outcome }}
+        O_CODE: ${{ steps.code.outcome }}
+        O_BACKEND: ${{ steps.backend.outcome }}
+        O_FRONTEND: ${{ steps.frontend.outcome }}
+        O_HEALTH: ${{ steps.health.outcome }}
+        JOB_STATUS: ${{ job.status }}
       run: |
-        ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << "ENDSSH"
-          # Load NVM
-          export NVM_DIR="$HOME/.nvm"
-          [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-          
-          echo "=========================================="
-          echo "Running Health Checks"
-          echo "=========================================="
-          
-          # Wait for services to start
-          echo "Waiting for services to stabilize..."
-          sleep 5
-          
-          # Check backend health
+        label() {
+          case "$1" in
+            success)   echo "passed" ;;
+            failure)   echo "FAILED" ;;
+            skipped)   echo "not run" ;;
+            cancelled) echo "cancelled" ;;
+            *)         echo "$1" ;;
+          esac
+        }
+        {
+          echo "## Deployment summary"
           echo ""
-          echo "Testing backend health..."
-          HEALTH_CHECK=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/health || echo "000")
-          
-          if [ "$HEALTH_CHECK" = "200" ]; then
-            echo "Backend health check passed (HTTP $HEALTH_CHECK)"
-          else
-            echo "Backend health check failed (HTTP $HEALTH_CHECK)"
-            echo "Backend logs:"
-            pm2 logs bmi-backend --lines 20 --nostream
-            exit 1
-          fi
-          
-          # Check PM2 status
+          echo "| Item | Value |"
+          echo "|------|-------|"
+          echo "| Commit | \`${GIT_SHA}\` |"
+          echo "| Branch | \`${GITHUB_REF_NAME}\` |"
+          echo "| Overall result | **$JOB_STATUS** |"
           echo ""
-          echo "PM2 Status:"
-          pm2 status
-          
-          # Check Nginx if installed
-          if command -v nginx &> /dev/null; then
+          echo "| Task | Result |"
+          echo "|------|--------|"
+          echo "| Validate inputs and secrets | $(label "$O_GUARD") |"
+          echo "| Prepare SSH | $(label "$O_PREPARE") |"
+          echo "| Connect to server | $(label "$O_SSH") |"
+          echo "| Install prerequisites | $(label "$O_PREREQ") |"
+          echo "| Set up database | $(label "$O_DB") |"
+          echo "| Back up current deployment | $(label "$O_BACKUP") |"
+          echo "| Sync code to this commit | $(label "$O_CODE") |"
+          echo "| Deploy backend | $(label "$O_BACKEND") |"
+          echo "| Deploy frontend and nginx | $(label "$O_FRONTEND") |"
+          echo "| Health check | $(label "$O_HEALTH") |"
+          echo ""
+          echo "\"not run\" means the task was skipped by an input or an earlier failure."
+          if [ -s "${REPORT_FILE:-/nonexistent}" ]; then
             echo ""
-            echo "Nginx Status:"
-            sudo systemctl status nginx --no-pager -l
+            echo "### Task log (what actually happened)"
+            echo ""
+            echo '```'
+            cat "$REPORT_FILE"
+            echo '```'
           fi
-          
-          echo ""
-          echo "All health checks passed"
-          echo ""
-        ENDSSH
+        } >> "$GITHUB_STEP_SUMMARY"
 
-    - name: Deployment Summary
+    - name: Clean up temporary files
       if: always()
       run: |
-        echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
-        echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
-        echo "| **Repository** | ${{ github.repository }} |" >> $GITHUB_STEP_SUMMARY
-        echo "| **Commit** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
-        echo "| **Branch** | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
-        echo "| **Deployed to** | ${{ secrets.EC2_HOST }} |" >> $GITHUB_STEP_SUMMARY
-        echo "| **Status** | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "### Quick Links" >> $GITHUB_STEP_SUMMARY
-        echo "- **Application**: http://${{ secrets.EC2_HOST }}" >> $GITHUB_STEP_SUMMARY
-        echo "- **Health Check**: http://${{ secrets.EC2_HOST }}:3000/health" >> $GITHUB_STEP_SUMMARY
-        echo "- **API Endpoint**: http://${{ secrets.EC2_HOST }}/api/measurements" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        if [ "${{ job.status }}" = "success" ]; then
-          echo "**Deployment completed successfully**" >> $GITHUB_STEP_SUMMARY
-        else
-          echo "**Deployment failed. Check logs for details.**" >> $GITHUB_STEP_SUMMARY
+        if [ -n "${WORK_DIR:-}" ] && [ -d "$WORK_DIR" ]; then
+          rm -rf "$WORK_DIR"
+          echo "removed $WORK_DIR (SSH key and helper)"
         fi
