@@ -35,7 +35,7 @@ defaults:
 
 jobs:
   deploy:
-    runs-on: self-hosted
+    runs-on: ostadBatch15
     timeout-minutes: 25
     env:
       DEPLOY_PATH: /home/ubuntu/single-server-3tier-webapp
