@@ -68,6 +68,14 @@ main() {
         sudo apt install -y git
         print_message "$GREEN" "✅ Git installed successfully"
     fi
+
+    # Node.js binaries from nvm need libatomic on minimal Ubuntu images
+    if dpkg -s libatomic1 &> /dev/null; then
+        print_message "$GREEN" "✅ libatomic1 is already installed"
+    else
+        sudo apt install -y libatomic1
+        print_message "$GREEN" "✅ libatomic1 installed successfully"
+    fi
     echo ""
     
     # Configure SSH
