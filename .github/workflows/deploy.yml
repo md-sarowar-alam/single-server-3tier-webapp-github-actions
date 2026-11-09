@@ -72,8 +72,10 @@ jobs:
           fi
         done
         if [ "$BACKEND_ONLY" = "true" ] && [ "$FRONTEND_ONLY" = "true" ]; then
-          echo "::error::backend_only and frontend_only cannot both be true"
-          fail=1
+          echo "::notice::backend_only and frontend_only are both ticked; deploying backend and frontend"
+          BACKEND_ONLY=false
+          FRONTEND_ONLY=false
+          { echo "BACKEND_ONLY=false"; echo "FRONTEND_ONLY=false"; } >> "$GITHUB_ENV"
         fi
         [[ "$EC2_HOST" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::EC2_HOST has unexpected characters"; fail=1; }
         [[ "$EC2_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo "::error::EC2_USER has unexpected characters"; fail=1; }
